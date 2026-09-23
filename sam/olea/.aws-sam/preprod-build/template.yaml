@@ -1,0 +1,327 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Olea-owned challenge, trust registry, verification, receipt, and evidence-vault
+  infrastructure.
+Parameters:
+  StageName:
+    Type: String
+    Default: poc
+  ChallengeTtlSeconds:
+    Type: Number
+    Default: '300'
+Globals:
+  Function:
+    Runtime: nodejs22.x
+    Architectures:
+    - arm64
+    MemorySize: 512
+    Timeout: 30
+    Tracing: Active
+    Environment:
+      Variables:
+        LOG_LEVEL: INFO
+Resources:
+  DataKey:
+    Type: AWS::KMS::Key
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Description: Olea oracle data encryption key.
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+        - Sid: AccountAdministration
+          Effect: Allow
+          Principal:
+            AWS:
+              Fn::Sub: arn:${AWS::Partition}:iam::${AWS::AccountId}:root
+          Action: kms:*
+          Resource: '*'
+  SigningKey:
+    Type: AWS::KMS::Key
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Description: Olea challenge signing key.
+      KeySpec: ECC_NIST_P256
+      KeyUsage: SIGN_VERIFY
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+        - Sid: AccountAdministration
+          Effect: Allow
+          Principal:
+            AWS:
+              Fn::Sub: arn:${AWS::Partition}:iam::${AWS::AccountId}:root
+          Action: kms:*
+          Resource: '*'
+  ChallengeTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+      - AttributeName: requestId
+        AttributeType: S
+      KeySchema:
+      - AttributeName: requestId
+        KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId:
+          Ref: DataKey
+  PolicyTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+      - AttributeName: policyVersion
+        AttributeType: S
+      KeySchema:
+      - AttributeName: policyVersion
+        KeyType: HASH
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId:
+          Ref: DataKey
+  ReleaseRegistryTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+      - AttributeName: eifDigest
+        AttributeType: S
+      KeySchema:
+      - AttributeName: eifDigest
+        KeyType: HASH
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId:
+          Ref: DataKey
+  ReceiptTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+      - AttributeName: evidenceId
+        AttributeType: S
+      KeySchema:
+      - AttributeName: evidenceId
+        KeyType: HASH
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId:
+          Ref: DataKey
+  EvidenceVault:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      ObjectLockEnabled: true
+      ObjectLockConfiguration:
+        ObjectLockEnabled: Enabled
+        Rule:
+          DefaultRetention:
+            Mode: COMPLIANCE
+            Days: 30
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+        - ServerSideEncryptionByDefault:
+            SSEAlgorithm: aws:kms
+            KMSMasterKeyID:
+              Fn::GetAtt:
+              - DataKey
+              - Arn
+          BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+  EvidenceVaultPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket:
+        Ref: EvidenceVault
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Sid: DenyInsecureTransport
+          Effect: Deny
+          Principal: '*'
+          Action: s3:*
+          Resource:
+          - Fn::GetAtt:
+            - EvidenceVault
+            - Arn
+          - Fn::Sub: ${EvidenceVault.Arn}/*
+          Condition:
+            Bool:
+              aws:SecureTransport: false
+  Api:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: olea-oracle-control-plane
+      StageName:
+        Ref: StageName
+      TracingEnabled: true
+      MethodSettings:
+      - ResourcePath: /*
+        HttpMethod: '*'
+        MetricsEnabled: true
+        DataTraceEnabled: false
+        LoggingLevel: ERROR
+  VerificationFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Description: Single Olea module for challenge issuance and evidence verification.
+      CodeUri: VerificationFunction
+      Handler: index.handler
+      Environment:
+        Variables:
+          CHALLENGE_TABLE:
+            Ref: ChallengeTable
+          POLICY_TABLE:
+            Ref: PolicyTable
+          RELEASE_TABLE:
+            Ref: ReleaseRegistryTable
+          RECEIPT_TABLE:
+            Ref: ReceiptTable
+          EVIDENCE_VAULT:
+            Ref: EvidenceVault
+          OLEA_SIGNING_KEY_ID:
+            Ref: SigningKey
+          CHALLENGE_TTL_SECONDS:
+            Ref: ChallengeTtlSeconds
+      Policies:
+      - DynamoDBCrudPolicy:
+          TableName:
+            Ref: ChallengeTable
+      - DynamoDBCrudPolicy:
+          TableName:
+            Ref: PolicyTable
+      - DynamoDBCrudPolicy:
+          TableName:
+            Ref: ReleaseRegistryTable
+      - DynamoDBCrudPolicy:
+          TableName:
+            Ref: ReceiptTable
+      - S3CrudPolicy:
+          BucketName:
+            Ref: EvidenceVault
+      - KMSDecryptPolicy:
+          KeyId:
+            Ref: DataKey
+      - Statement:
+        - Effect: Allow
+          Action:
+          - kms:Encrypt
+          - kms:GenerateDataKey
+          Resource:
+            Fn::GetAtt:
+            - DataKey
+            - Arn
+        - Effect: Allow
+          Action:
+          - kms:GetPublicKey
+          - kms:Sign
+          Resource:
+            Fn::GetAtt:
+            - SigningKey
+            - Arn
+      Events:
+        Challenge:
+          Type: Api
+          Properties:
+            RestApiId:
+              Ref: Api
+            Path: /v1/challenges
+            Method: POST
+        Evidence:
+          Type: Api
+          Properties:
+            RestApiId:
+              Ref: Api
+            Path: /v1/evidence
+            Method: POST
+        RegisterPolicy:
+          Type: Api
+          Properties:
+            RestApiId:
+              Ref: Api
+            Path: /v1/policies
+            Method: POST
+        GetPolicy:
+          Type: Api
+          Properties:
+            RestApiId:
+              Ref: Api
+            Path: /v1/policies/{policyVersion}
+            Method: GET
+        RegisterRelease:
+          Type: Api
+          Properties:
+            RestApiId:
+              Ref: Api
+            Path: /v1/releases
+            Method: POST
+        GetRelease:
+          Type: Api
+          Properties:
+            RestApiId:
+              Ref: Api
+            Path: /v1/releases/{eifDigest}
+            Method: GET
+        RevokeRelease:
+          Type: Api
+          Properties:
+            RestApiId:
+              Ref: Api
+            Path: /v1/releases/{eifDigest}/revoke
+            Method: POST
+        GetReceipt:
+          Type: Api
+          Properties:
+            RestApiId:
+              Ref: Api
+            Path: /v1/receipts/{evidenceId}
+            Method: GET
+    Metadata:
+      SamResourceId: VerificationFunction
+Outputs:
+  ApiUrl:
+    Value:
+      Fn::Sub: https://${Api}.execute-api.${AWS::Region}.${AWS::URLSuffix}/${StageName}
+  EvidenceVaultName:
+    Value:
+      Ref: EvidenceVault
+  SigningKeyArn:
+    Value:
+      Fn::GetAtt:
+      - SigningKey
+      - Arn

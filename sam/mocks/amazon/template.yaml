@@ -1,0 +1,105 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: API Gateway-only Amazon LWA and SP-API contract mocks for the Olea-Dowsure PoC.
+
+Parameters:
+  StageName:
+    Type: String
+    Default: mock
+
+Resources:
+  Api:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: amazon-sp-api-contract-mock
+      StageName: !Ref StageName
+      DefinitionBody:
+        swagger: '2.0'
+        info: { title: Amazon SP-API contract mock, version: '1.0' }
+        paths:
+          /auth/o2/token:
+            post:
+              responses: { '200': { description: Mock LWA token } }
+              x-amazon-apigateway-integration:
+                type: mock
+                requestTemplates:
+                  application/json: '{"statusCode":200}'
+                  application/x-www-form-urlencoded: '{"statusCode":200}'
+                responses:
+                  default:
+                    statusCode: '200'
+                    responseTemplates:
+                      {
+                        application/json: '{"access_token":"mock-lwa-token","token_type":"bearer","expires_in":3600}',
+                      }
+          /orders/v0/orders:
+            get:
+              responses: { '200': { description: Mock orders } }
+              x-amazon-apigateway-integration:
+                type: mock
+                requestTemplates: { application/json: '{"statusCode":200}' }
+                responses:
+                  default:
+                    statusCode: '200'
+                    responseTemplates:
+                      {
+                        application/json: '{"payload":{"Orders":[{"AmazonOrderId":"MOCK-ORDER-001","OrderStatus":"Shipped"}]}}',
+                      }
+          /finances/v0/financialEvents:
+            get:
+              responses: { '200': { description: Mock financial events } }
+              x-amazon-apigateway-integration:
+                type: mock
+                requestTemplates: { application/json: '{"statusCode":200}' }
+                responses:
+                  default:
+                    statusCode: '200'
+                    responseTemplates:
+                      {
+                        application/json: '{"payload":{"FinancialEvents":{"ShipmentEventList":[]}}}',
+                      }
+          /reports/2021-06-30/reports:
+            post:
+              responses: { '202': { description: Mock report creation } }
+              x-amazon-apigateway-integration:
+                type: mock
+                requestTemplates: { application/json: '{"statusCode":202}' }
+                responses:
+                  default:
+                    statusCode: '202'
+                    responseTemplates:
+                      { application/json: '{"reportId":"MOCK-REPORT-001"}' }
+          /reports/2021-06-30/reports/{reportId}:
+            get:
+              parameters:
+                [{ name: reportId, in: path, required: true, type: string }]
+              responses: { '200': { description: Mock completed report } }
+              x-amazon-apigateway-integration:
+                type: mock
+                requestTemplates: { application/json: '{"statusCode":200}' }
+                responses:
+                  default:
+                    statusCode: '200'
+                    responseTemplates:
+                      {
+                        application/json: '{"reportId":"MOCK-REPORT-001","processingStatus":"DONE","reportDocumentId":"MOCK-DOCUMENT-001"}',
+                      }
+          /reports/2021-06-30/documents/{documentId}:
+            get:
+              parameters:
+                [{ name: documentId, in: path, required: true, type: string }]
+              responses: { '200': { description: Mock document metadata } }
+              x-amazon-apigateway-integration:
+                type: mock
+                requestTemplates: { application/json: '{"statusCode":200}' }
+                responses:
+                  default:
+                    statusCode: '200'
+                    responseTemplates:
+                      {
+                        application/json: '{"reportDocumentId":"MOCK-DOCUMENT-001","url":"mock://report/MOCK-DOCUMENT-001","compressionAlgorithm":"NONE"}',
+                      }
+
+Outputs:
+  ApiUrl:
+    Value: !Sub https://${Api}.execute-api.${AWS::Region}.${AWS::URLSuffix}/${StageName}

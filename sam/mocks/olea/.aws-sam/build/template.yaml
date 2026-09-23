@@ -1,0 +1,81 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: API Gateway-only Olea contract mock for independent Dowsure workflow
+  testing.
+Parameters:
+  StageName:
+    Type: String
+    Default: mock
+Resources:
+  Api:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: olea-contract-mock
+      StageName:
+        Ref: StageName
+      DefinitionBody:
+        swagger: '2.0'
+        info:
+          title: Olea contract mock
+          version: '1.0'
+        paths:
+          /v1/challenges:
+            post:
+              responses:
+                '201':
+                  description: Static scoped challenge
+              x-amazon-apigateway-integration:
+                type: mock
+                requestTemplates:
+                  application/json: '{"statusCode":201}'
+                responses:
+                  default:
+                    statusCode: '201'
+                    responseTemplates:
+                      application/json: '{"requestId":"req-poc-001","nonce":"mock-single-use-nonce","policyVersion":"v1.0","endpointScope":["GET_ORDERS","GET_FINANCIAL_EVENTS","CREATE_REPORT","GET_REPORT","GET_REPORT_DOCUMENT"],"transformationVersion":"tx-v1","issuedAt":"2026-09-23T10:00:00Z","expiresAt":"2099-09-23T10:05:00Z","challengeSignature":"mock-olea-signature"}'
+          /v1/evidence:
+            post:
+              responses:
+                '202':
+                  description: Static accepted verdict
+              x-amazon-apigateway-integration:
+                type: mock
+                requestTemplates:
+                  application/json: '{"statusCode":202}'
+                responses:
+                  default:
+                    statusCode: '202'
+                    responseTemplates:
+                      application/json: '{"status":"ACCEPTED","reasonCode":"SUCCESS","evidenceId":"mock-evidence-001","receiptId":"mock-receipt-001"}'
+          /v1/releases:
+            post:
+              responses:
+                '201':
+                  description: Static release registration
+              x-amazon-apigateway-integration:
+                type: mock
+                requestTemplates:
+                  application/json: '{"statusCode":201}'
+                responses:
+                  default:
+                    statusCode: '201'
+                    responseTemplates:
+                      application/json: '{"status":"REGISTERED","eifDigest":"mock-eif-digest"}'
+          /v1/policies:
+            post:
+              responses:
+                '201':
+                  description: Static policy registration
+              x-amazon-apigateway-integration:
+                type: mock
+                requestTemplates:
+                  application/json: '{"statusCode":201}'
+                responses:
+                  default:
+                    statusCode: '201'
+                    responseTemplates:
+                      application/json: '{"status":"REGISTERED","policyVersion":"v1.0"}'
+Outputs:
+  ApiUrl:
+    Value:
+      Fn::Sub: https://${Api}.execute-api.${AWS::Region}.${AWS::URLSuffix}/${StageName}

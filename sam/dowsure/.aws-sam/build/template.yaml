@@ -1,0 +1,158 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Dowsure Lambda-free orchestration with a minimal parent/enclave-agent
+  PoC fixture.
+Parameters:
+  StageName:
+    Type: String
+    Default: poc
+  OleaApiBaseUrl:
+    Type: String
+    Description: Base URL from the deployed Olea stack, without a trailing slash.
+  AmazonApiBaseUrl:
+    Type: String
+    Description: Base URL for the approved Amazon Orders endpoint, without a trailing
+      slash.
+  ConnectionApiKey:
+    Type: String
+    NoEcho: true
+    Default: poc-only-replace-me
+Resources:
+  OrchestrationApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: dowsure-orchestration
+      StageName:
+        Ref: StageName
+      TracingEnabled: true
+  ParentAgentMockApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: dowsure-parent-agent-poc-mock
+      StageName:
+        Ref: StageName
+      DefinitionBody:
+        swagger: '2.0'
+        info:
+          title: Dowsure parent enclave agent PoC mock
+          version: '1.0'
+        paths:
+          /acquisitions:
+            post:
+              responses:
+                '202':
+                  description: Acquisition queued
+              x-amazon-apigateway-integration:
+                type: mock
+                requestTemplates:
+                  application/json: '{"statusCode":202}'
+                responses:
+                  default:
+                    statusCode: '202'
+                    responseTemplates:
+                      application/json: '{"jobId":"mock-job-001","status":"PROCESSING"}'
+          /acquisitions/{jobId}:
+            get:
+              parameters:
+              - name: jobId
+                in: path
+                required: true
+                type: string
+              responses:
+                '200':
+                  description: Opaque evidence ready
+              x-amazon-apigateway-integration:
+                type: mock
+                requestTemplates:
+                  application/json: '{"statusCode":200}'
+                responses:
+                  default:
+                    statusCode: '200'
+                    responseTemplates:
+                      application/json: '{"jobId":"mock-job-001","status":"COMPLETED","evidenceId":"mock-evidence-001","encryptedEvidenceReference":"mock://opaque/evidence-001","manifestDigest":"mock-manifest-digest","submissionSignature":"mock-signature","eifDigest":"mock-eif-digest","pcr0":"mock-pcr0","pcr1":"mock-pcr1","pcr2":"mock-pcr2"}'
+  WorkflowConnection:
+    Type: AWS::Events::Connection
+    Properties:
+      Name:
+        Fn::Sub: dowsure-oracle-${AWS::StackName}
+      AuthorizationType: API_KEY
+      AuthParameters:
+        ApiKeyAuthParameters:
+          ApiKeyName: x-poc-connection
+          ApiKeyValue:
+            Ref: ConnectionApiKey
+  WorkflowEvents:
+    Type: AWS::Events::EventBus
+    Properties:
+      Name:
+        Fn::Sub: dowsure-oracle-${AWS::StackName}
+  AcquisitionStateMachine:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      Name:
+        Fn::Sub: dowsure-acquisition-${AWS::StackName}
+      Type: STANDARD
+      DefinitionUri: ..\..\statemachine\acquisition.asl.json
+      DefinitionSubstitutions:
+        OleaApiUrl:
+          Ref: OleaApiBaseUrl
+        AmazonApiUrl:
+          Ref: AmazonApiBaseUrl
+        DowsureAgentApiUrl:
+          Fn::Sub: https://${ParentAgentMockApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}/${StageName}
+        ConnectionArn:
+          Fn::GetAtt:
+          - WorkflowConnection
+          - Arn
+        EventBusName:
+          Ref: WorkflowEvents
+      Tracing:
+        Enabled: true
+      Policies:
+      - Statement:
+        - Effect: Allow
+          Action: states:InvokeHTTPEndpoint
+          Resource: '*'
+        - Effect: Allow
+          Action: events:RetrieveConnectionCredentials
+          Resource:
+            Fn::GetAtt:
+            - WorkflowConnection
+            - Arn
+        - Effect: Allow
+          Action:
+          - secretsmanager:DescribeSecret
+          - secretsmanager:GetSecretValue
+          Resource:
+            Fn::Sub: arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:events!connection/*
+        - Effect: Allow
+          Action: kms:Decrypt
+          Resource:
+            Fn::Sub: arn:${AWS::Partition}:kms:${AWS::Region}:${AWS::AccountId}:key/*
+        - Effect: Allow
+          Action: events:PutEvents
+          Resource:
+            Fn::GetAtt:
+            - WorkflowEvents
+            - Arn
+      Events:
+        StartAcquisition:
+          Type: Api
+          Properties:
+            RestApiId:
+              Ref: OrchestrationApi
+            Path: /v1/acquisitions
+            Method: POST
+Outputs:
+  OrchestrationApiUrl:
+    Value:
+      Fn::Sub: https://${OrchestrationApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}/${StageName}/v1/acquisitions
+  ParentAgentMockApiUrl:
+    Value:
+      Fn::Sub: https://${ParentAgentMockApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}/${StageName}
+  StateMachineArn:
+    Value:
+      Ref: AcquisitionStateMachine
+  EventBusName:
+    Value:
+      Ref: WorkflowEvents

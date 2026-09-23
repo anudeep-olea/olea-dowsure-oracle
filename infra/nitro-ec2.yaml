@@ -1,0 +1,193 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Private Nitro Enclave PoC host for the bounded GET_ORDERS acquisition path.
+Metadata:
+  AWSToolsMetrics:
+    AWSAgentToolkit: aws-cloudformation@2
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+  ImageId:
+    Type: AWS::EC2::Image::Id
+    Description: x86_64 Amazon Linux AMI with Nitro Enclave support.
+  OleaApiBaseUrl:
+    Type: String
+    Description: Private or reachable Olea API base URL without a trailing slash.
+  InstanceType:
+    Type: String
+    Default: c5.xlarge
+    AllowedValues: [c5.xlarge, c5.2xlarge, m5.xlarge, m5.2xlarge]
+  ArtifactKey:
+    Type: String
+    Default: nitro/enclave-context.tar.gz
+  LaunchHost:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: Launch the billable Nitro host after the artifact has been uploaded.
+
+Conditions:
+  ShouldLaunchHost: !Equals [!Ref LaunchHost, 'true']
+
+Resources:
+  ArtifactBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Stores the versioned enclave build context before the private host builds the EIF.
+        must: Keep public access blocked and never store credentials in the artifact.
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+
+  EnclaveSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Provides egress for the parent coordinator while keeping the private host unreachable from inbound network traffic.
+        must: Do not add public ingress; use Session Manager.
+    Properties:
+      GroupDescription: Nitro enclave parent host egress-only security group.
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS to Olea, S3, SSM, and approved upstream endpoints.
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-enclave-host-sg
+
+  EnclaveRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Grants only SSM management and read access to the build artifact prefix.
+        must: Do not add source credentials or broad write permissions to the instance role.
+    Properties:
+      RoleName: !Sub ${AWS::StackName}-enclave-host
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: ReadEnclaveBuildArtifact
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [s3:GetObject, s3:GetObjectVersion]
+                Resource: !Sub '${ArtifactBucket.Arn}/${ArtifactKey}*'
+              - Effect: Allow
+                Action: s3:ListBucket
+                Resource: !GetAtt ArtifactBucket.Arn
+                Condition:
+                  StringLike:
+                    s3:prefix:
+                      - !Ref ArtifactKey
+                      - !Sub '${ArtifactKey}/*'
+
+  EnclaveInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref EnclaveRole]
+
+  EnclaveHost:
+    Type: AWS::EC2::Instance
+    Condition: ShouldLaunchHost
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Runs the Nitro Enclave allocator, EIF builder, parent coordinator, and vsock bridge for the PoC.
+        must: Keep EnclaveOptions enabled, IMDSv2 required, the host private, and the EIF source credential-free.
+    Properties:
+      ImageId: !Ref ImageId
+      InstanceType: !Ref InstanceType
+      IamInstanceProfile: !Ref EnclaveInstanceProfile
+      SubnetId: !Ref SubnetId
+      SecurityGroupIds: [!Ref EnclaveSecurityGroup]
+      EnclaveOptions:
+        Enabled: true
+      MetadataOptions:
+        HttpTokens: required
+        HttpEndpoint: enabled
+        HttpPutResponseHopLimit: 1
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: 40
+            VolumeType: gp3
+            Encrypted: true
+            DeleteOnTermination: true
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euxo pipefail
+          dnf install -y aws-nitro-enclaves-cli aws-nitro-enclaves-cli-devel docker tar gzip
+          systemctl enable --now docker
+          mkdir -p /etc/nitro_enclaves /opt/olea-nitro
+          cat >/etc/nitro_enclaves/allocator.yaml <<'EOF'
+          ---
+          memory_mib: 4096
+          cpu_count: 2
+          EOF
+          systemctl enable --now nitro-enclaves-allocator
+          export NITRO_CLI_ARTIFACTS=/var/lib/nitro_enclaves
+          mkdir -p "$NITRO_CLI_ARTIFACTS"
+          for attempt in $(seq 1 60); do
+            if aws s3 cp s3://${ArtifactBucket}/${ArtifactKey} /opt/olea-nitro/context.tar.gz; then break; fi
+            sleep 10
+          done
+          test -s /opt/olea-nitro/context.tar.gz
+          rm -rf /opt/olea-nitro/context
+          mkdir -p /opt/olea-nitro/context
+          tar -xzf /opt/olea-nitro/context.tar.gz -C /opt/olea-nitro/context
+          cd /opt/olea-nitro/context/nitro-enclave
+          mvn -q package -DskipTests
+          docker build -t olea-nitro-orders:latest /opt/olea-nitro/context/nitro-enclave
+          nitro-cli build-enclave --docker-uri olea-nitro-orders:latest --output-file /opt/olea-nitro/olea-orders.eif
+          nitro-cli run-enclave --cpu-count 2 --memory 2048 --eif-path /opt/olea-nitro/olea-orders.eif --enclave-cid 16 --debug-mode > /var/log/olea-enclave.json
+          cat >/opt/olea-nitro/runtime.env <<EOF
+          OLEA_API_BASE_URL=${OleaApiBaseUrl}
+          ENCLAVE_CID=16
+          ENCLAVE_PORT=5005
+          EOF
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-host
+        - Key: Workload
+          Value: OleaDowsureNitroPoC
+        - Key: Environment
+          Value: preprod
+
+Outputs:
+  EnclaveHostInstanceId:
+    Condition: ShouldLaunchHost
+    Value: !Ref EnclaveHost
+  EnclaveArtifactBucket:
+    Value: !Ref ArtifactBucket
+  EnclaveSecurityGroupId:
+    Value: !Ref EnclaveSecurityGroup
+  EnclaveHostRoleArn:
+    Value: !GetAtt EnclaveRole.Arn

@@ -1,0 +1,69 @@
+{
+  "Comment": "Dowsure orchestration. Tokens, source payloads, report URLs, PII, and decrypted evidence never enter workflow state.",
+  "StartAt": "Validate Input",
+  "States": {
+    "Validate Input": {
+      "Type": "Choice",
+      "Choices": [{"And": [{"Variable": "$.requestId", "IsPresent": true}, {"Variable": "$.source", "StringEquals": "mock-api"}, {"Variable": "$.endpoint", "StringEquals": "GET_ORDERS"}, {"Variable": "$.operation", "IsPresent": true}], "Next": "Request Olea Challenge"}],
+        "Default": "Invalid Input"
+    },
+    "Invalid Input": {"Type": "Fail", "Error": "INVALID_REQUEST", "Cause": "Required acquisition context is missing"},
+    "Request Olea Challenge": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::http:invoke",
+      "Parameters": {"ApiEndpoint": "${OleaApiUrl}/v1/challenges", "Method": "POST", "Authentication": {"ConnectionArn": "${ConnectionArn}"}, "Headers": {"Content-Type": "application/json"}, "RequestBody.$": "$"},
+      "ResultPath": "$.challengeCall",
+      "Retry": [{"ErrorEquals": ["States.Http.StatusCode.429", "States.Http.StatusCode.500", "States.Http.StatusCode.502", "States.Http.StatusCode.503", "States.Http.StatusCode.504"], "IntervalSeconds": 2, "BackoffRate": 2, "MaxAttempts": 3}],
+      "Catch": [{"ErrorEquals": ["States.ALL"], "ResultPath": "$.failure", "Next": "Publish Failure"}],
+      "Next": "Validate Challenge"
+    },
+    "Validate Challenge": {
+      "Type": "Choice",
+      "Choices": [{"And": [{"Variable": "$.challengeCall.ResponseBody.requestId", "IsPresent": true}, {"Variable": "$.challengeCall.ResponseBody.nonce", "IsPresent": true}, {"Variable": "$.challengeCall.ResponseBody.expiresAt", "IsPresent": true}], "Next": "Start Enclave Acquisition"}],
+      "Default": "Invalid Challenge"
+    },
+    "Invalid Challenge": {"Type": "Pass", "Parameters": {"Error": "CHALLENGE_INVALID", "Cause": "Olea challenge response is incomplete"}, "ResultPath": "$.failure", "Next": "Publish Failure"},
+    "Start Enclave Acquisition": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::http:invoke",
+      "Parameters": {"ApiEndpoint": "${DowsureAgentApiUrl}/acquisitions", "Method": "POST", "Authentication": {"ConnectionArn": "${ConnectionArn}"}, "Headers": {"Content-Type": "application/json"}, "RequestBody": {"request.$": "$", "challenge.$": "$.challengeCall.ResponseBody"}},
+      "ResultPath": "$.acquisitionCall",
+      "Retry": [{"ErrorEquals": ["States.Http.StatusCode.429", "States.Http.StatusCode.500", "States.Http.StatusCode.502", "States.Http.StatusCode.503", "States.Http.StatusCode.504"], "IntervalSeconds": 2, "BackoffRate": 2, "MaxAttempts": 3}],
+      "Catch": [{"ErrorEquals": ["States.ALL"], "ResultPath": "$.failure", "Next": "Publish Failure"}],
+      "Next": "Initialize Poll Count"
+    },
+    "Initialize Poll Count": {"Type": "Pass", "Result": 0, "ResultPath": "$.pollCount", "Next": "Wait Before Poll"},
+    "Wait Before Poll": {"Type": "Wait", "Seconds": 5, "Next": "Poll Enclave Acquisition"},
+    "Poll Enclave Acquisition": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::http:invoke",
+      "Parameters": {"ApiEndpoint.$": "States.Format('${DowsureAgentApiUrl}/acquisitions/{}', $.acquisitionCall.ResponseBody.jobId)", "Method": "GET", "Authentication": {"ConnectionArn": "${ConnectionArn}"}},
+      "ResultPath": "$.pollCall",
+      "Retry": [{"ErrorEquals": ["States.Http.StatusCode.429", "States.Http.StatusCode.500", "States.Http.StatusCode.502", "States.Http.StatusCode.503", "States.Http.StatusCode.504"], "IntervalSeconds": 2, "BackoffRate": 2, "MaxAttempts": 3}],
+      "Catch": [{"ErrorEquals": ["States.ALL"], "ResultPath": "$.failure", "Next": "Publish Failure"}],
+      "Next": "Check Acquisition Status"
+    },
+    "Check Acquisition Status": {
+      "Type": "Choice",
+      "Choices": [{"Variable": "$.pollCall.ResponseBody.status", "StringEquals": "COMPLETED", "Next": "Submit Evidence"}, {"Variable": "$.pollCall.ResponseBody.status", "StringEquals": "FAILED", "Next": "Acquisition Failed"}, {"Variable": "$.pollCount", "NumericGreaterThanEquals": 20, "Next": "Acquisition Timed Out"}],
+      "Default": "Increment Poll Count"
+    },
+    "Increment Poll Count": {"Type": "Pass", "Parameters": {"value.$": "States.MathAdd($.pollCount, 1)"}, "ResultPath": "$.counter", "Next": "Copy Poll Count"},
+    "Copy Poll Count": {"Type": "Pass", "InputPath": "$.counter.value", "ResultPath": "$.pollCount", "Next": "Wait Before Poll"},
+    "Acquisition Failed": {"Type": "Pass", "Parameters": {"Error": "ACQUISITION_FAILED", "Cause.$": "$.pollCall.ResponseBody.reasonCode"}, "ResultPath": "$.failure", "Next": "Publish Failure"},
+    "Acquisition Timed Out": {"Type": "Pass", "Parameters": {"Error": "ACQUISITION_TIMEOUT", "Cause": "Enclave job exceeded the PoC polling limit"}, "ResultPath": "$.failure", "Next": "Publish Failure"},
+    "Submit Evidence": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::http:invoke",
+      "Parameters": {"ApiEndpoint": "${OleaApiUrl}/v1/evidence", "Method": "POST", "Authentication": {"ConnectionArn": "${ConnectionArn}"}, "Headers": {"Content-Type": "application/json"}, "RequestBody": {"requestId.$": "$.challengeCall.ResponseBody.requestId", "evidenceId.$": "$.pollCall.ResponseBody.evidenceId", "nonce.$": "$.challengeCall.ResponseBody.nonce", "policyVersion.$": "$.challengeCall.ResponseBody.policyVersion", "source.$": "$.source", "endpoint.$": "$.endpoint", "encryptedEvidenceReference.$": "$.pollCall.ResponseBody.encryptedEvidenceReference", "manifestDigest.$": "$.pollCall.ResponseBody.manifestDigest", "submissionSignature.$": "$.pollCall.ResponseBody.submissionSignature", "rawPayload.$": "$.pollCall.ResponseBody.rawPayload", "rawPayloadDigest.$": "$.pollCall.ResponseBody.rawPayloadDigest", "transformedPayload.$": "$.pollCall.ResponseBody.transformedPayload", "transformedPayloadDigest.$": "$.pollCall.ResponseBody.transformedPayloadDigest", "canonicalizationVersion.$": "$.pollCall.ResponseBody.canonicalizationVersion", "tlsProofType.$": "$.pollCall.ResponseBody.tlsProofType", "tlsProofHash.$": "$.pollCall.ResponseBody.tlsProofHash", "tlsProofResponseHash.$": "$.pollCall.ResponseBody.tlsProofResponseHash", "attestationDocument.$": "$.pollCall.ResponseBody.attestationDocument", "attestedPublicKeyBase64.$": "$.pollCall.ResponseBody.attestedPublicKeyBase64", "eifDigest.$": "$.pollCall.ResponseBody.eifDigest", "pcr0.$": "$.pollCall.ResponseBody.pcr0", "pcr1.$": "$.pollCall.ResponseBody.pcr1", "pcr2.$": "$.pollCall.ResponseBody.pcr2"}},
+      "ResultPath": "$.verificationCall",
+      "Retry": [{"ErrorEquals": ["States.Http.StatusCode.429", "States.Http.StatusCode.500", "States.Http.StatusCode.502", "States.Http.StatusCode.503", "States.Http.StatusCode.504"], "IntervalSeconds": 2, "BackoffRate": 2, "MaxAttempts": 3}],
+      "Catch": [{"ErrorEquals": ["States.ALL"], "ResultPath": "$.failure", "Next": "Publish Failure"}],
+      "Next": "Publish Completion"
+    },
+    "Publish Completion": {"Type": "Task", "Resource": "arn:aws:states:::events:putEvents", "Parameters": {"Entries": [{"Source": "olea.dowsure.oracle", "DetailType": "Evidence Verification Completed", "Detail.$": "States.JsonToString($.verificationCall.ResponseBody)", "EventBusName": "${EventBusName}"}]}, "ResultPath": "$.event", "Next": "Return Verdict"},
+    "Return Verdict": {"Type": "Pass", "InputPath": "$.verificationCall.ResponseBody", "End": true},
+    "Publish Failure": {"Type": "Task", "Resource": "arn:aws:states:::events:putEvents", "Parameters": {"Entries": [{"Source": "olea.dowsure.oracle", "DetailType": "Evidence Workflow Failed", "Detail.$": "States.JsonToString($.failure)", "EventBusName": "${EventBusName}"}]}, "Next": "Fail Workflow"},
+    "Fail Workflow": {"Type": "Fail", "Error": "ORACLE_WORKFLOW_FAILED", "Cause": "See workflow failure event and execution history"}
+  }
+}

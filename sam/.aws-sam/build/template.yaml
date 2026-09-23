@@ -1,0 +1,538 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Olea-Dowsure oracle PoC with API Gateway-native Amazon API mocks.
+Parameters:
+  StageName:
+    Type: String
+    Default: mock
+  ChallengeTtlSeconds:
+    Type: Number
+    Default: '300'
+Globals:
+  Function:
+    Runtime: nodejs22.x
+    Architectures:
+    - arm64
+    MemorySize: 256
+    Timeout: 15
+    Tracing: Active
+    Environment:
+      Variables:
+        LOG_LEVEL: INFO
+Resources:
+  OleaDataKey:
+    Type: AWS::KMS::Key
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Description: Olea oracle control-plane and evidence encryption key.
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+        - Sid: AccountAdministration
+          Effect: Allow
+          Principal:
+            AWS:
+              Fn::Sub: arn:${AWS::Partition}:iam::${AWS::AccountId}:root
+          Action: kms:*
+          Resource: '*'
+  OleaDataKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName:
+        Fn::Sub: alias/olea-oracle-${AWS::StackName}
+      TargetKeyId:
+        Ref: OleaDataKey
+  ChallengeTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+      - AttributeName: requestId
+        AttributeType: S
+      KeySchema:
+      - AttributeName: requestId
+        KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId:
+          Ref: OleaDataKey
+  PolicyTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+      - AttributeName: policyVersion
+        AttributeType: S
+      KeySchema:
+      - AttributeName: policyVersion
+        KeyType: HASH
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId:
+          Ref: OleaDataKey
+  ReleaseRegistryTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+      - AttributeName: eifDigest
+        AttributeType: S
+      KeySchema:
+      - AttributeName: eifDigest
+        KeyType: HASH
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId:
+          Ref: OleaDataKey
+  ReceiptTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+      - AttributeName: evidenceId
+        AttributeType: S
+      KeySchema:
+      - AttributeName: evidenceId
+        KeyType: HASH
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId:
+          Ref: OleaDataKey
+  EvidenceVault:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      ObjectLockEnabled: true
+      ObjectLockConfiguration:
+        ObjectLockEnabled: Enabled
+        Rule:
+          DefaultRetention:
+            Mode: COMPLIANCE
+            Days: 30
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+        - ServerSideEncryptionByDefault:
+            SSEAlgorithm: aws:kms
+            KMSMasterKeyID:
+              Fn::GetAtt:
+              - OleaDataKey
+              - Arn
+          BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+  EvidenceVaultPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket:
+        Ref: EvidenceVault
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Sid: DenyInsecureTransport
+          Effect: Deny
+          Principal: '*'
+          Action: s3:*
+          Resource:
+          - Fn::GetAtt:
+            - EvidenceVault
+            - Arn
+          - Fn::Sub: ${EvidenceVault.Arn}/*
+          Condition:
+            Bool:
+              aws:SecureTransport: false
+  OleaApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: olea-oracle-control-plane
+      StageName:
+        Ref: StageName
+      TracingEnabled: true
+      MethodSettings:
+      - ResourcePath: /*
+        HttpMethod: '*'
+        MetricsEnabled: true
+        DataTraceEnabled: false
+        LoggingLevel: ERROR
+  OleaVerificationFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Description: Single Olea module for challenge issuance and cryptographic evidence
+        verification.
+      CodeUri: OleaVerificationFunction
+      Handler: index.handler
+      Environment:
+        Variables:
+          CHALLENGE_TABLE:
+            Ref: ChallengeTable
+          POLICY_TABLE:
+            Ref: PolicyTable
+          RELEASE_TABLE:
+            Ref: ReleaseRegistryTable
+          RECEIPT_TABLE:
+            Ref: ReceiptTable
+          EVIDENCE_VAULT:
+            Ref: EvidenceVault
+          CHALLENGE_TTL_SECONDS:
+            Ref: ChallengeTtlSeconds
+      Policies:
+      - DynamoDBCrudPolicy:
+          TableName:
+            Ref: ChallengeTable
+      - DynamoDBCrudPolicy:
+          TableName:
+            Ref: PolicyTable
+      - DynamoDBCrudPolicy:
+          TableName:
+            Ref: ReleaseRegistryTable
+      - DynamoDBCrudPolicy:
+          TableName:
+            Ref: ReceiptTable
+      - S3CrudPolicy:
+          BucketName:
+            Ref: EvidenceVault
+      - KMSDecryptPolicy:
+          KeyId:
+            Ref: OleaDataKey
+      - Statement:
+        - Effect: Allow
+          Action:
+          - kms:Encrypt
+          - kms:GenerateDataKey
+          Resource:
+            Fn::GetAtt:
+            - OleaDataKey
+            - Arn
+      Events:
+        Challenge:
+          Type: Api
+          Properties:
+            RestApiId:
+              Ref: OleaApi
+            Path: /v1/challenges
+            Method: POST
+        Evidence:
+          Type: Api
+          Properties:
+            RestApiId:
+              Ref: OleaApi
+            Path: /v1/evidence
+            Method: POST
+        RegisterPolicy:
+          Type: Api
+          Properties:
+            RestApiId:
+              Ref: OleaApi
+            Path: /v1/policies
+            Method: POST
+        GetPolicy:
+          Type: Api
+          Properties:
+            RestApiId:
+              Ref: OleaApi
+            Path: /v1/policies/{policyVersion}
+            Method: GET
+        RegisterRelease:
+          Type: Api
+          Properties:
+            RestApiId:
+              Ref: OleaApi
+            Path: /v1/releases
+            Method: POST
+        GetRelease:
+          Type: Api
+          Properties:
+            RestApiId:
+              Ref: OleaApi
+            Path: /v1/releases/{eifDigest}
+            Method: GET
+        RevokeRelease:
+          Type: Api
+          Properties:
+            RestApiId:
+              Ref: OleaApi
+            Path: /v1/releases/{eifDigest}/revoke
+            Method: POST
+        GetReceipt:
+          Type: Api
+          Properties:
+            RestApiId:
+              Ref: OleaApi
+            Path: /v1/receipts/{evidenceId}
+            Method: GET
+    Metadata:
+      SamResourceId: OleaVerificationFunction
+  WorkflowConnection:
+    Type: AWS::Events::Connection
+    Properties:
+      Name:
+        Fn::Sub: olea-dowsure-poc-${AWS::StackName}
+      AuthorizationType: API_KEY
+      AuthParameters:
+        ApiKeyAuthParameters:
+          ApiKeyName: x-poc-connection
+          ApiKeyValue: olea-dowsure-poc
+  WorkflowEvents:
+    Type: AWS::Events::EventBus
+    Properties:
+      Name:
+        Fn::Sub: olea-oracle-${AWS::StackName}
+  AcquisitionStateMachine:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      Name:
+        Fn::Sub: olea-dowsure-acquisition-${AWS::StackName}
+      Type: STANDARD
+      DefinitionUri: ..\..\statemachine\acquisition.asl.json
+      DefinitionSubstitutions:
+        OleaApiUrl:
+          Fn::Sub: https://${OleaApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}/${StageName}
+        DowsureAgentApiUrl:
+          Fn::Sub: https://${DowsureAgentMockApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}/${StageName}
+        ConnectionArn:
+          Fn::GetAtt:
+          - WorkflowConnection
+          - Arn
+        EventBusName:
+          Ref: WorkflowEvents
+      Policies:
+      - Statement:
+        - Effect: Allow
+          Action: states:InvokeHTTPEndpoint
+          Resource: '*'
+        - Effect: Allow
+          Action: events:RetrieveConnectionCredentials
+          Resource:
+            Fn::GetAtt:
+            - WorkflowConnection
+            - Arn
+        - Effect: Allow
+          Action: secretsmanager:GetSecretValue
+          Resource:
+            Fn::Sub: arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:events!connection/*
+        - Effect: Allow
+          Action: kms:Decrypt
+          Resource:
+            Fn::Sub: arn:${AWS::Partition}:kms:${AWS::Region}:${AWS::AccountId}:key/*
+        - Effect: Allow
+          Action: events:PutEvents
+          Resource:
+            Fn::GetAtt:
+            - WorkflowEvents
+            - Arn
+      Events:
+        StartAcquisition:
+          Type: Api
+          Properties:
+            RestApiId:
+              Ref: OrchestrationApi
+            Path: /v1/acquisitions
+            Method: POST
+  OrchestrationApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: dowsure-orchestration
+      StageName:
+        Ref: StageName
+      TracingEnabled: true
+  DowsureAgentMockApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: dowsure-enclave-agent-poc-mock
+      StageName:
+        Ref: StageName
+      DefinitionBody:
+        swagger: '2.0'
+        info:
+          title: Dowsure enclave agent PoC mock
+          version: '1.0'
+        paths:
+          /acquisitions:
+            post:
+              responses:
+                '202':
+                  description: Acquisition queued
+              x-amazon-apigateway-integration:
+                type: mock
+                requestTemplates:
+                  application/json: '{"statusCode":202}'
+                responses:
+                  default:
+                    statusCode: '202'
+                    responseTemplates:
+                      application/json: '{"jobId":"mock-job-001","status":"PROCESSING"}'
+          /acquisitions/{jobId}:
+            get:
+              parameters:
+              - name: jobId
+                in: path
+                required: true
+                type: string
+              responses:
+                '200':
+                  description: Opaque evidence ready
+              x-amazon-apigateway-integration:
+                type: mock
+                requestTemplates:
+                  application/json: '{"statusCode":200}'
+                responses:
+                  default:
+                    statusCode: '200'
+                    responseTemplates:
+                      application/json: '{"jobId":"mock-job-001","status":"COMPLETED","encryptedEvidenceReference":"mock://opaque/evidence-001","manifestDigest":"mock-manifest-digest","submissionSignature":"mock-signature"}'
+  AmazonMockApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: amazon-sp-api-poc-mock
+      StageName:
+        Ref: StageName
+      DefinitionBody:
+        swagger: '2.0'
+        info:
+          title: Amazon SP-API PoC mock
+          version: '1.0'
+        paths:
+          /auth/o2/token:
+            post:
+              responses:
+                '200':
+                  description: Mock LWA token
+              x-amazon-apigateway-integration:
+                type: mock
+                requestTemplates:
+                  application/json: '{"statusCode":200}'
+                  application/x-www-form-urlencoded: '{"statusCode":200}'
+                responses:
+                  default:
+                    statusCode: '200'
+                    responseTemplates:
+                      application/json: '{"access_token":"mock-lwa-token","token_type":"bearer","expires_in":3600}'
+          /orders/v0/orders:
+            get:
+              responses:
+                '200':
+                  description: Mock orders
+              x-amazon-apigateway-integration:
+                type: mock
+                requestTemplates:
+                  application/json: '{"statusCode":200}'
+                responses:
+                  default:
+                    statusCode: '200'
+                    responseTemplates:
+                      application/json: '{"payload":{"Orders":[{"AmazonOrderId":"MOCK-ORDER-001","OrderStatus":"Shipped"}]}}'
+          /finances/v0/financialEvents:
+            get:
+              responses:
+                '200':
+                  description: Mock financial events
+              x-amazon-apigateway-integration:
+                type: mock
+                requestTemplates:
+                  application/json: '{"statusCode":200}'
+                responses:
+                  default:
+                    statusCode: '200'
+                    responseTemplates:
+                      application/json: '{"payload":{"FinancialEvents":{"ShipmentEventList":[]}}}'
+          /reports/2021-06-30/reports:
+            post:
+              responses:
+                '202':
+                  description: Mock report creation
+              x-amazon-apigateway-integration:
+                type: mock
+                requestTemplates:
+                  application/json: '{"statusCode":202}'
+                responses:
+                  default:
+                    statusCode: '202'
+                    responseTemplates:
+                      application/json: '{"reportId":"MOCK-REPORT-001"}'
+          /reports/2021-06-30/reports/{reportId}:
+            get:
+              parameters:
+              - name: reportId
+                in: path
+                required: true
+                type: string
+              responses:
+                '200':
+                  description: Mock completed report
+              x-amazon-apigateway-integration:
+                type: mock
+                requestTemplates:
+                  application/json: '{"statusCode":200}'
+                responses:
+                  default:
+                    statusCode: '200'
+                    responseTemplates:
+                      application/json: '{"reportId":"MOCK-REPORT-001","processingStatus":"DONE","reportDocumentId":"MOCK-DOCUMENT-001"}'
+          /reports/2021-06-30/documents/{documentId}:
+            get:
+              parameters:
+              - name: documentId
+                in: path
+                required: true
+                type: string
+              responses:
+                '200':
+                  description: Mock document metadata
+              x-amazon-apigateway-integration:
+                type: mock
+                requestTemplates:
+                  application/json: '{"statusCode":200}'
+                responses:
+                  default:
+                    statusCode: '200'
+                    responseTemplates:
+                      application/json: '{"reportDocumentId":"MOCK-DOCUMENT-001","url":"mock://report/MOCK-DOCUMENT-001","compressionAlgorithm":"NONE"}'
+Outputs:
+  OleaApiUrl:
+    Value:
+      Fn::Sub: https://${OleaApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}/${StageName}
+  OrchestrationApiUrl:
+    Value:
+      Fn::Sub: https://${OrchestrationApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}/${StageName}/v1/acquisitions
+  DowsureAgentMockApiUrl:
+    Value:
+      Fn::Sub: https://${DowsureAgentMockApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}/${StageName}
+  AmazonMockApiUrl:
+    Value:
+      Fn::Sub: https://${AmazonMockApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}/${StageName}
+  AcquisitionStateMachineArn:
+    Value:
+      Ref: AcquisitionStateMachine
+  EvidenceVaultName:
+    Value:
+      Ref: EvidenceVault
